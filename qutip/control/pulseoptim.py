@@ -378,7 +378,7 @@ def optimize_pulse(
         log_level = logger.getEffectiveLevel()
     else:
         logger.setLevel(log_level)
-        
+
     # The parameters types are checked in create_pulse_optimizer
     # so no need to do so here
     # However, the deprecation management is repeated here
@@ -830,7 +830,6 @@ def optimize_pulse_unitary(
             if not 'phase_option' in fid_params:
                 fid_params['phase_option'] = phase_option
             
-            
     return optimize_pulse(
             drift=H_d, ctrls=H_c, initial=U_0, target=U_targ,
             num_tslots=num_tslots, evo_time=evo_time, tau=tau,
@@ -847,7 +846,8 @@ def optimize_pulse_unitary(
             ramping_pulse_params=ramping_pulse_params,
             log_level=log_level, out_file_ext=out_file_ext,
             gen_stats=gen_stats)
-            
+
+
 def opt_pulse_crab(
         drift, ctrls, initial, target,
         num_tslots=None, evo_time=None, tau=None,
@@ -1850,6 +1850,8 @@ def create_pulse_optimizer(
                                 "via 'optim_method' parameter")
     elif optim_method_up == 'FMIN_BFGS':
         optim = optimizer.OptimizerBFGS(cfg, dyn)
+    elif optim_method_up == 'LBFGSB_CUSTOM':
+        optim = optimizer.OptimizerLBFGSB_CustomObj(cfg, dyn, params=optim_params)
     elif optim_method_up == 'LBFGSB' or optim_method_up == 'FMIN_L_BFGS_B':
         optim = optimizer.OptimizerLBFGSB(cfg, dyn)
     elif optim_method_up == 'FMIN':

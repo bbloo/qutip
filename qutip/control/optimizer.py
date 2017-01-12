@@ -676,6 +676,53 @@ class Optimizer(object):
 
         return err
 
+    def err_func_wrapper(self, *args):
+        """
+        Get the error achieved using the ctrl amplitudes passed
+        in as the first argument.
+
+        This is called by generic optimisation algorithm as the
+        func to the minimised. The argument is the current
+        variable values, i.e. control amplitudes, passed as
+        a flat array. Hence these are reshaped as [nTimeslots, n_ctrls]
+        and then used to update the stored ctrl values (if they have changed)
+
+        The error is checked against the target, and the optimisation is
+        terminated if the target has been achieved.
+        """
+        self.num_fid_func_calls += 1
+        # *** update stats ***
+        if self.stats is not None:
+            self.stats.num_fidelity_func_calls = self.num_fid_func_calls
+            if self.log_level <= logging.DEBUG:
+                logger.debug("fidelity error call {}".format(
+                    self.stats.num_fidelity_func_calls))
+
+        amps = self._get_ctrl_amps(args[0].copy())
+        self.dynamics.update_ctrl_amps(amps)
+
+        tc = self.termination_conditions
+        fid_err = self.dynamics.fid_computer.get_fid_err()
+
+        err = fid_err + 10*np.exp(-0.05*(fid_err)**-1)\
+              + np.dot(self.params["penalty_function_weights"],
+                       np.asarray([fun(amps) for fun in self.params["penalty_functions"]]))
+
+        if self.iter_summary:
+            self.iter_summary.fid_func_call_num = self.num_fid_func_calls
+            self.iter_summary.fid_err = err
+
+        if self.dump and self.dump.dump_fid_err:
+            self.dump.update_fid_err_log(err)
+
+        if err <= tc.fid_err_targ:
+            raise errors.GoalAchievedTerminate(err)
+
+        if self.num_fid_func_calls > tc.max_fid_func_calls:
+            raise errors.MaxFidFuncCallTerminate()
+
+        return err
+
     def fid_err_grad_wrapper(self, *args):
         """
         Get the gradient of the fidelity error with respect to all of the
@@ -1013,6 +1060,130 @@ class OptimizerLBFGSB(Optimizer):
             amps = self._get_ctrl_amps(optim_var_vals)
             dyn.update_ctrl_amps(amps)
             warn = res_dict['warnflag']
+            if warn == 0:
+                result.grad_norm_min_reached = True
+                result.termination_reason = "function converged"
+            elif warn == 1:
+                result.max_iter_exceeded = True
+                result.termination_reason = ("Iteration or fidelity "
+                                             "function call limit reached")
+            elif warn == 2:
+                result.termination_reason = res_dict['task']
+
+            result.num_iter = res_dict['nit']
+        except errors.OptimizationTerminate as except_term:
+            self._interpret_term_exception(except_term, result)
+
+        end_time = timeit.default_timer()
+        self._add_common_result_attribs(result, st_time, end_time)
+
+        return result
+
+
+class OptimizerLBFGSB_CustomObj(OptimizerLBFGSB):
+    """
+    Implements the run_optimization method using the L-BFGS-B algorithm. With a custom objective
+    function to minimize
+
+    Attributes
+    ----------
+    max_metric_corr : integer
+        The maximum number of variable metric corrections used to define
+        the limited memory matrix. That is the number of previous
+        gradient values that are used to approximate the Hessian
+        see the scipy.optimize.fmin_l_bfgs_b documentation for description
+        of m argument
+
+    """
+
+    def run_optimization(self, term_conds=None):
+        """
+        Optimise the control pulse amplitudes to minimise the fidelity error
+        using the L-BFGS-B algorithm, which is the constrained
+        (bounded amplitude values), limited memory, version of the
+        Broyden–Fletcher–Goldfarb–Shanno algorithm.
+
+        The optimisation end when one of the passed termination conditions
+        has been met, e.g. target achieved, gradient minimum met
+        (local minima), wall time / iteration count exceeded.
+
+        Essentially this is wrapper to the:
+        scipy.optimize.fmin_l_bfgs_b function
+        This in turn is a warpper for well established implementation of
+        the L-BFGS-B algorithm written in Fortran, which is therefore
+        very fast. See SciPy documentation for credit and details on
+        this function.
+
+        If the parameter term_conds=None, then the termination_conditions
+        attribute must already be set. It will be overwritten if the
+        parameter is not None
+
+        The result is returned in an OptimResult object, which includes
+        the final fidelity, time evolution, reason for termination etc
+
+        """
+        self.init_optim(term_conds)
+        term_conds = self.termination_conditions
+        dyn = self.dynamics
+        cfg = self.config
+        self.optim_var_vals = self._get_optim_var_vals()
+        self._build_method_options()
+
+        st_time = timeit.default_timer()
+        self.wall_time_optimize_start = st_time
+
+        if self.stats is not None:
+            self.stats.wall_time_optim_start = st_time
+            self.stats.wall_time_optim_end = 0.0
+            self.stats.num_iter = 1
+
+        bounds = self._build_bounds_list()
+        result = self._create_result()
+
+        fprime = None
+        self.approx_grad = True
+
+        if 'accuracy_factor' in self.method_options:
+            factr = self.method_options['accuracy_factor']
+        elif 'ftol' in self.method_options:
+            factr = self.method_options['ftol']
+        elif hasattr(term_conds, 'accuracy_factor'):
+            factr = term_conds.accuracy_factor
+        else:
+            factr = 1e3
+
+        if 'max_metric_corr' in self.method_options:
+            m = self.method_options['max_metric_corr']
+        elif 'maxcor' in self.method_options:
+            m = self.method_options['maxcor']
+        elif hasattr(self, 'max_metric_corr'):
+            m = self.max_metric_corr
+        else:
+            m = 10
+
+        if self.log_level <= logging.INFO:
+            msg = ("Optimising pulse(s) using {} with "
+                   "'fmin_l_bfgs_b' method").format(self.alg)
+            if self.approx_grad:
+                msg += " (approx grad)"
+            logger.info(msg)
+        try:
+            print "Hi, about to run custom!"
+            optim_var_vals, fid, res_dict = spopt.fmin_l_bfgs_b(
+                self.err_func_wrapper, self.optim_var_vals,
+                fprime=fprime,
+                approx_grad=self.approx_grad,
+                callback=self.iter_step_callback_func,
+                bounds=self.bounds, m=m, factr=factr,
+                pgtol=term_conds.min_gradient_norm,
+                disp=self.msg_level,
+                maxfun=term_conds.max_fid_func_calls,
+                maxiter=term_conds.max_iterations)
+
+            amps = self._get_ctrl_amps(optim_var_vals)
+            dyn.update_ctrl_amps(amps)
+            warn = res_dict['warnflag']
+            result.grad_norm_final = res_dict['grad']
             if warn == 0:
                 result.grad_norm_min_reached = True
                 result.termination_reason = "function converged"
